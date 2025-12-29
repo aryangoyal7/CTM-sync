@@ -139,3 +139,16 @@ You can download the data and checkpoints from here:
 - maze data: https://drive.google.com/file/d/1cBgqhaUUtsrll8-o2VY42hPpyBcfFv86/view?usp=drivesdk
 
 Checkpoints go in the `checkpoints` folder. For instance, when properly populated, the checkpoints folder will have the maze checkpoint in `checkpoints/mazes/...`
+
+## Note on pull requests
+_(Update: 29 December 2025)_
+
+Please note that all pull requests will be assessed for their contributions. Those that involve either a bug-fix or an efficiency upgrade will likely pass review. 
+
+On the other hand, any pull requests that change the fundamental functionality of this repository will be immediately rejected and closed: the purpose of this repository is to accompany the Continuous Thought Machines paper and, therefore, it must remain an accurate reflection of that work. 
+
+That being said, we are happy to consider advances and deviations from the original repository as long as they:
+1. Are sufficiently self-contained (single feature additions per pull request).
+2. Well-justified with quantitative evidence.
+3. Not overclaiming to be _fundamental_.
+4. Do not change the default behavior of the original codebase. For example, while early stopping is useful, this should be set up in a way that is an optional extra, as opposed to the default behavior.
