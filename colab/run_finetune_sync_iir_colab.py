@@ -19,10 +19,64 @@ from models.ctm_sync_filters import ContinuousThoughtMachineIIR
 from tasks.image_classification.train_finetune_sync_common import (
     enable_requires_grad_by_prefix,
     get_trainable_params,
+    load_checkpoint_raw,
+    extract_state_dict_from_checkpoint,
     load_checkpoint_forgiving,
     set_requires_grad,
 )
 from colab.streaming_imagenet_min import get_min_imagenet_loaders
+
+
+def _maybe_load_hf_token_from_dotenv() -> None:
+    try:
+        from dotenv import load_dotenv  # type: ignore
+
+        env_path = Path(__file__).resolve().parent / ".env"
+        if env_path.exists():
+            load_dotenv(dotenv_path=str(env_path), override=False)
+    except Exception:
+        pass
+
+
+def _infer_arch_from_state_dict(sd: dict) -> dict:
+    d_model = int(sd["start_activated_state"].numel()) if "start_activated_state" in sd else None
+    d_input = None
+    w = sd.get("synapses.first_projection.0.weight", None)
+    if w is not None and d_model is not None:
+        in_features = int(w.shape[1])
+        d_input = in_features - d_model
+
+    down_idxs = []
+    for k in sd.keys():
+        if k.startswith("synapses.down_projections."):
+            parts = k.split(".")
+            if len(parts) > 2 and parts[2].isdigit():
+                down_idxs.append(int(parts[2]))
+    synapse_depth = (max(down_idxs) + 2) if down_idxs else None
+
+    p_out = int(sd.get("decay_params_out").numel()) if "decay_params_out" in sd else None
+    p_action = int(sd.get("decay_params_action").numel()) if "decay_params_action" in sd else None
+    left_out = int(sd.get("out_neuron_indices_left").numel()) if "out_neuron_indices_left" in sd else None
+    left_action = int(sd.get("action_neuron_indices_left").numel()) if "action_neuron_indices_left" in sd else None
+
+    neuron_select_type = None
+    n_synch_out = None
+    n_synch_action = None
+    if p_out is not None and left_out is not None and p_out == left_out:
+        neuron_select_type = "random-pairing"
+        n_synch_out = p_out
+    if p_action is not None and left_action is not None and p_action == left_action:
+        neuron_select_type = neuron_select_type or "random-pairing"
+        n_synch_action = p_action
+
+    return {
+        "d_model": d_model,
+        "d_input": d_input,
+        "synapse_depth": synapse_depth,
+        "neuron_select_type": neuron_select_type,
+        "n_synch_out": n_synch_out,
+        "n_synch_action": n_synch_action,
+    }
 
 
 def parse_args():
@@ -40,28 +94,29 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--image_size", type=int, default=224)
     p.add_argument("--shuffle_buffer_size", type=int, default=2000)
+    p.add_argument("--hf_token", type=str, default=None, help="Optional HF token (preferred: set HF_TOKEN env / colab/.env).")
 
     # Training
     p.add_argument("--epochs", type=int, default=2)
     p.add_argument("--lr", type=float, default=1e-4)
 
-    # CTM (match ImageNet checkpoint expectations by default)
-    p.add_argument("--d_model", type=int, default=4096)
-    p.add_argument("--d_input", type=int, default=128)
-    p.add_argument("--heads", type=int, default=4)
-    p.add_argument("--iterations", type=int, default=50)
-    p.add_argument("--synapse_depth", type=int, default=4)
-    p.add_argument("--memory_length", type=int, default=25)
+    # CTM (auto-inferred from checkpoint unless explicitly overridden)
+    p.add_argument("--d_model", type=int, default=None)
+    p.add_argument("--d_input", type=int, default=None)
+    p.add_argument("--heads", type=int, default=None)
+    p.add_argument("--iterations", type=int, default=None)
+    p.add_argument("--synapse_depth", type=int, default=None)
+    p.add_argument("--memory_length", type=int, default=None)
     p.add_argument("--deep_memory", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--memory_hidden_dims", type=int, default=4)
     p.add_argument("--dropout", type=float, default=0.0)
     p.add_argument("--dropout_nlm", type=float, default=None)
     p.add_argument("--do_normalisation", action=argparse.BooleanOptionalAction, default=False)
-    p.add_argument("--backbone_type", type=str, default="resnet18-4")
-    p.add_argument("--positional_embedding_type", type=str, default="none")
-    p.add_argument("--n_synch_out", type=int, default=512)
-    p.add_argument("--n_synch_action", type=int, default=512)
-    p.add_argument("--neuron_select_type", type=str, default="random-pairing")
+    p.add_argument("--backbone_type", type=str, default=None)
+    p.add_argument("--positional_embedding_type", type=str, default=None)
+    p.add_argument("--n_synch_out", type=int, default=None)
+    p.add_argument("--n_synch_action", type=int, default=None)
+    p.add_argument("--neuron_select_type", type=str, default=None)
     p.add_argument("--n_random_pairing_self", type=int, default=0)
 
     # IIR specifics
@@ -77,6 +132,24 @@ def main():
     os.makedirs(args.log_dir, exist_ok=True)
 
     device = "cuda" if (args.device == "cuda" and torch.cuda.is_available()) else "cpu"
+    _maybe_load_hf_token_from_dotenv()
+    if args.hf_token and not os.environ.get("HF_TOKEN"):
+        os.environ["HF_TOKEN"] = args.hf_token
+
+    ckpt = load_checkpoint_raw(args.checkpoint_path, map_location="cpu")
+    sd = extract_state_dict_from_checkpoint(ckpt, checkpoint_path=args.checkpoint_path)
+    inferred = _infer_arch_from_state_dict(sd)
+    ckpt_args = ckpt.get("args", None)
+
+    def _get(name, default=None):
+        if getattr(args, name) is not None:
+            return getattr(args, name)
+        if ckpt_args is not None and hasattr(ckpt_args, name):
+            return getattr(ckpt_args, name)
+        if ckpt_args is not None and isinstance(ckpt_args, dict) and name in ckpt_args:
+            return ckpt_args[name]
+        return inferred.get(name, default)
+
     loaders = get_min_imagenet_loaders(
         n_train=args.n_train,
         n_val=args.n_val,
@@ -91,31 +164,31 @@ def main():
     prediction_reshaper = [-1]
 
     model = ContinuousThoughtMachineIIR(
-        iterations=args.iterations,
-        d_model=args.d_model,
-        d_input=args.d_input,
-        heads=args.heads,
-        n_synch_out=args.n_synch_out,
-        n_synch_action=args.n_synch_action,
-        synapse_depth=args.synapse_depth,
-        memory_length=args.memory_length,
+        iterations=_get("iterations", 50),
+        d_model=_get("d_model", 4096),
+        d_input=_get("d_input", 1024),
+        heads=_get("heads", 4),
+        n_synch_out=_get("n_synch_out", 512),
+        n_synch_action=_get("n_synch_action", 512),
+        synapse_depth=_get("synapse_depth", 8),
+        memory_length=_get("memory_length", 25),
         deep_nlms=args.deep_memory,
         memory_hidden_dims=args.memory_hidden_dims,
         do_layernorm_nlm=args.do_normalisation,
-        backbone_type=args.backbone_type,
-        positional_embedding_type=args.positional_embedding_type,
+        backbone_type=_get("backbone_type", "resnet18-4"),
+        positional_embedding_type=_get("positional_embedding_type", "none"),
         out_dims=out_dims,
         prediction_reshaper=prediction_reshaper,
         dropout=args.dropout,
         dropout_nlm=args.dropout_nlm,
-        neuron_select_type=args.neuron_select_type,
+        neuron_select_type=_get("neuron_select_type", "random-pairing"),
         n_random_pairing_self=args.n_random_pairing_self,
         iir_alpha_init=args.iir_alpha_init,
         iir_eps=args.iir_eps,
     ).to(device)
 
-    xb, yb = next(iter(loaders.trainloader))
-    model(xb.to(device))
+    dummy = torch.randn(1, 3, args.image_size, args.image_size, device=device)
+    model(dummy)
 
     load_res = load_checkpoint_forgiving(model, args.checkpoint_path, map_location=device, strict=False)
     print(f"Loaded checkpoint. Missing={len(load_res.missing_keys)} Unexpected={len(load_res.unexpected_keys)}")

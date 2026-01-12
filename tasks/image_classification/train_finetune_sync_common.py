@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import zipfile
 from pathlib import Path
-from typing import List, Sequence
+from typing import Any, Dict, List, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -36,9 +36,28 @@ def load_checkpoint_forgiving(
     strict: bool = False,
     drop_prefixes: Sequence[str] = (),
 ) -> torch.nn.modules.module._IncompatibleKeys:
-    ckpt_path = Path(checkpoint_path)
+    ckpt_path = resolve_checkpoint_path(checkpoint_path)
 
-    # The provided Google Drive "checkpoint.pt" is sometimes a zip bundle containing the actual .pt.
+    ckpt = torch.load(str(ckpt_path), map_location=map_location, weights_only=False)
+    state_dict = extract_state_dict_from_checkpoint(ckpt, checkpoint_path=checkpoint_path)
+
+    # Handle DDP 'module.' prefix if present.
+    has_module_prefix = all(k.startswith("module.") for k in state_dict.keys())
+    if has_module_prefix:
+        state_dict = {k.partition("module.")[2]: v for k, v in state_dict.items()}
+
+    if drop_prefixes:
+        state_dict = {k: v for k, v in state_dict.items() if not any(k.startswith(p) for p in drop_prefixes)}
+
+    return model.load_state_dict(state_dict, strict=strict)
+
+
+def resolve_checkpoint_path(checkpoint_path: str) -> Path:
+    """
+    If `checkpoint_path` is a zip bundle (e.g. the Drive download), extract the inner .pt and return its path.
+    Otherwise return the original path.
+    """
+    ckpt_path = Path(checkpoint_path)
     if zipfile.is_zipfile(ckpt_path):
         with zipfile.ZipFile(ckpt_path, "r") as zf:
             members = [
@@ -50,33 +69,32 @@ def load_checkpoint_forgiving(
             ]
             if len(members) == 0:
                 raise ValueError(f"No .pt/.pth/.bin files found inside zip checkpoint: {checkpoint_path}")
-
-            # Prefer a single inner checkpoint if present.
             inner = members[0] if len(members) == 1 else members[0]
             extracted = ckpt_path.parent / inner
             extracted.parent.mkdir(parents=True, exist_ok=True)
             if not extracted.exists() or extracted.stat().st_size == 0:
                 zf.extract(inner, path=ckpt_path.parent)
-            ckpt_path = extracted
+            return extracted
+    return ckpt_path
 
-    ckpt = torch.load(str(ckpt_path), map_location=map_location, weights_only=False)
+
+def extract_state_dict_from_checkpoint(ckpt: Any, *, checkpoint_path: str) -> Dict[str, torch.Tensor]:
     if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
-        state_dict = ckpt["model_state_dict"]
-    elif isinstance(ckpt, dict) and all(isinstance(k, str) for k in ckpt.keys()):
-        # Might already be a raw state_dict
-        state_dict = ckpt
-    else:
-        raise ValueError(f"Unrecognized checkpoint format at {checkpoint_path}")
+        return ckpt["model_state_dict"]
+    if isinstance(ckpt, dict) and all(isinstance(k, str) for k in ckpt.keys()):
+        return ckpt  # raw state_dict
+    raise ValueError(f"Unrecognized checkpoint format at {checkpoint_path}")
 
-    # Handle DDP 'module.' prefix if present.
-    has_module_prefix = all(k.startswith("module.") for k in state_dict.keys())
-    if has_module_prefix:
-        state_dict = {k.partition("module.")[2]: v for k, v in state_dict.items()}
 
-    if drop_prefixes:
-        state_dict = {k: v for k, v in state_dict.items() if not any(k.startswith(p) for p in drop_prefixes)}
-
-    return model.load_state_dict(state_dict, strict=strict)
+def load_checkpoint_raw(checkpoint_path: str, *, map_location: str) -> Dict[str, Any]:
+    """
+    Load a checkpoint dict (handling Drive zip bundles).
+    """
+    ckpt_path = resolve_checkpoint_path(checkpoint_path)
+    ckpt = torch.load(str(ckpt_path), map_location=map_location, weights_only=False)
+    if not isinstance(ckpt, dict):
+        raise ValueError(f"Expected checkpoint dict at {checkpoint_path}, got {type(ckpt)}")
+    return ckpt
 
 
 def maybe_subset_dataset(dataset, subset_size: int, seed: int):
