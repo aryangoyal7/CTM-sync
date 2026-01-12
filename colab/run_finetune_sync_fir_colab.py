@@ -64,12 +64,35 @@ def _infer_arch_from_state_dict(sd: dict) -> dict:
     neuron_select_type = None
     n_synch_out = None
     n_synch_action = None
-    if p_out is not None and left_out is not None and p_out == left_out:
-        neuron_select_type = "random-pairing"
-        n_synch_out = p_out
-    if p_action is not None and left_action is not None and p_action == left_action:
-        neuron_select_type = neuron_select_type or "random-pairing"
-        n_synch_action = p_action
+    if p_out is not None and left_out is not None:
+        # random-pairing: representation size == n_synch
+        if p_out == left_out:
+            neuron_select_type = "random-pairing"
+            n_synch_out = left_out
+        # first-last/random dense: representation size == n(n+1)/2
+        elif p_out == (left_out * (left_out + 1)) // 2:
+            n_synch_out = left_out
+    if p_action is not None and left_action is not None:
+        if p_action == left_action:
+            neuron_select_type = neuron_select_type or "random-pairing"
+            n_synch_action = left_action
+        elif p_action == (left_action * (left_action + 1)) // 2:
+            n_synch_action = left_action
+
+    # Detect 'first-last' if indices look like contiguous first and last blocks.
+    try:
+        out_left = sd.get("out_neuron_indices_left", None)
+        act_left = sd.get("action_neuron_indices_left", None)
+        if d_model is not None and out_left is not None and act_left is not None:
+            n_out = int(out_left.numel())
+            n_act = int(act_left.numel())
+            if (
+                torch.equal(out_left.cpu(), torch.arange(0, n_out))
+                and torch.equal(act_left.cpu(), torch.arange(d_model - n_act, d_model))
+            ):
+                neuron_select_type = "first-last"
+    except Exception:
+        pass
 
     return {
         "d_model": d_model,

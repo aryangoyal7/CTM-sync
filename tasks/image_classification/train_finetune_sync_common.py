@@ -49,7 +49,24 @@ def load_checkpoint_forgiving(
     if drop_prefixes:
         state_dict = {k: v for k, v in state_dict.items() if not any(k.startswith(p) for p in drop_prefixes)}
 
-    return model.load_state_dict(state_dict, strict=strict)
+    # IMPORTANT: torch will still error on size mismatches even with strict=False.
+    # Filter out any tensors whose shapes don't match the target model.
+    target_sd = model.state_dict()
+    filtered = {}
+    dropped = 0
+    for k, v in state_dict.items():
+        tv = target_sd.get(k, None)
+        if tv is None:
+            continue
+        if hasattr(tv, "shape") and hasattr(v, "shape") and tuple(tv.shape) != tuple(v.shape):
+            dropped += 1
+            continue
+        filtered[k] = v
+
+    if dropped:
+        print(f"[load_checkpoint_forgiving] Dropped {dropped} keys due to shape mismatch.")
+
+    return model.load_state_dict(filtered, strict=strict)
 
 
 def resolve_checkpoint_path(checkpoint_path: str) -> Path:
