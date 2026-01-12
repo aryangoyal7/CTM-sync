@@ -36,7 +36,8 @@ def parse_args():
     p.add_argument("--n_train", type=int, default=2000)
     p.add_argument("--n_val", type=int, default=500)
     p.add_argument("--batch_size", type=int, default=8)
-    p.add_argument("--num_workers", type=int, default=2)
+    # NOTE: keep this 0 by default so HuggingFace auth/token works reliably in Colab.
+    p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--image_size", type=int, default=224)
     p.add_argument("--shuffle_buffer_size", type=int, default=2000)
 

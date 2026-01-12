@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Iterator, Optional, Tuple
 
 import os
+from pathlib import Path
 import torch
 from torch.utils.data import DataLoader, IterableDataset
 from torchvision import transforms
@@ -42,7 +43,19 @@ class _StreamingImageNetIterable(IterableDataset):
         # In Colab: `from huggingface_hub import notebook_login; notebook_login()`
         #
         # Also: datasets no longer supports `trust_remote_code` here.
-        token = os.environ.get("HF_TOKEN", None)
+        # Load token from colab/.env if available (recommended for Colab non-interactive workers)
+        # Expected keys: HF_TOKEN or hf_token.
+        try:
+            from dotenv import load_dotenv  # type: ignore
+
+            env_path = Path(__file__).resolve().parent / ".env"
+            if env_path.exists():
+                load_dotenv(dotenv_path=str(env_path), override=False)
+        except Exception:
+            # If python-dotenv isn't installed, we'll fall back to the environment or interactive login.
+            pass
+
+        token = os.environ.get("HF_TOKEN") or os.environ.get("hf_token")
         ds = load_dataset("imagenet-1k", split=self.split, streaming=True, token=(token or True))
         if self.shuffle:
             ds = ds.shuffle(seed=self.seed, buffer_size=self.shuffle_buffer_size)
