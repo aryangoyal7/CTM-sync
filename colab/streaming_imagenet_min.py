@@ -56,7 +56,19 @@ class _StreamingImageNetIterable(IterableDataset):
             pass
 
         token = os.environ.get("HF_TOKEN") or os.environ.get("hf_token")
-        ds = load_dataset("imagenet-1k", split=self.split, streaming=True, token=(token or True))
+        # If token is not explicitly provided, `token=True` will try the cached HF login token.
+        # This works reliably in Colab when DataLoader uses num_workers=0.
+        token_to_use = token if token else True
+        try:
+            ds = load_dataset("imagenet-1k", split=self.split, streaming=True, token=token_to_use)
+        except Exception as e:
+            # Improve the error message for the common case: not logged in / no token present.
+            raise RuntimeError(
+                "Failed to load gated dataset 'imagenet-1k'. You must authenticate with HuggingFace.\n"
+                "- Recommended: create `colab/.env` containing `HF_TOKEN=hf_...` (do NOT commit it).\n"
+                "- Alternative: run `from huggingface_hub import notebook_login; notebook_login()` and set DataLoader num_workers=0.\n"
+                f"Original error: {type(e).__name__}: {e}"
+            ) from e
         if self.shuffle:
             ds = ds.shuffle(seed=self.seed, buffer_size=self.shuffle_buffer_size)
 
