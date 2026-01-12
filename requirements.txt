@@ -1,10 +1,10 @@
-numpy
+numpy<2
 torch
 torchvision
 matplotlib
 seaborn
 tqdm
-opencv-python
+opencv-python<4.12
 imageio
 scikit-learn
 umap-learn
@@ -15,3 +15,4 @@ datasets
 autoclip
 huggingface_hub
 safetensors
+tensorboard
