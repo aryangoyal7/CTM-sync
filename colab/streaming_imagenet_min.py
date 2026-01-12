@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterator, Optional, Tuple
 
+import os
 import torch
 from torch.utils.data import DataLoader, IterableDataset
 from torchvision import transforms
@@ -37,7 +38,12 @@ class _StreamingImageNetIterable(IterableDataset):
         self.transform = transform
 
     def __iter__(self) -> Iterator[Tuple[torch.Tensor, int]]:
-        ds = load_dataset("imagenet-1k", split=self.split, streaming=True, trust_remote_code=True)
+        # Note: imagenet-1k on HF is gated; you must authenticate first.
+        # In Colab: `from huggingface_hub import notebook_login; notebook_login()`
+        #
+        # Also: datasets no longer supports `trust_remote_code` here.
+        token = os.environ.get("HF_TOKEN", None)
+        ds = load_dataset("imagenet-1k", split=self.split, streaming=True, token=(token or True))
         if self.shuffle:
             ds = ds.shuffle(seed=self.seed, buffer_size=self.shuffle_buffer_size)
 
