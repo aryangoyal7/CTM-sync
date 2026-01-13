@@ -87,7 +87,9 @@ class MultiBandFIRSyncFilter(nn.Module):
     """
     Multi-band FIR filter bank.
 
-    Returns concatenated band outputs: (B, P * n_bands)
+    Combine modes:
+    - concat (default): returns concatenated band outputs (B, P * n_bands)
+    - sum: returns per-pair weighted sum across bands (B, P) with learnable band mixing per pair
     """
 
     def __init__(
@@ -95,6 +97,8 @@ class MultiBandFIRSyncFilter(nn.Module):
         n_pairs: int,
         band_ks: List[int],
         *,
+        combine: str = "concat",
+        band_mix_per_pair: bool = True,
         init: str = "exp",
         exp_alpha: float = 0.5,
     ):
@@ -107,6 +111,16 @@ class MultiBandFIRSyncFilter(nn.Module):
         self.n_pairs = int(n_pairs)
         self.band_ks = [int(k) for k in band_ks]
         self.k_max = max(self.band_ks)
+        self.combine = str(combine)
+        if self.combine not in ("concat", "sum"):
+            raise ValueError(f"Unknown combine={combine}. Expected one of: concat, sum")
+
+        self.n_bands = len(self.band_ks)
+        self.band_mix_per_pair = bool(band_mix_per_pair)
+        if self.combine == "sum":
+            # Learnable mixing weights across bands. Softmaxed along band dim.
+            mix_shape = (self.n_pairs, self.n_bands) if self.band_mix_per_pair else (self.n_bands,)
+            self.raw_band_mix = nn.Parameter(torch.zeros(mix_shape))
 
         raws = []
         for k in self.band_ks:
@@ -152,7 +166,19 @@ class MultiBandFIRSyncFilter(nn.Module):
             yb = (history[..., :k] * w.unsqueeze(0)).sum(dim=-1)  # (B, P)
             outs.append(yb)
 
-        y = torch.cat(outs, dim=-1)  # (B, P * n_bands)
+        if self.combine == "concat":
+            y = torch.cat(outs, dim=-1)  # (B, P * n_bands)
+        else:
+            # (n_bands, B, P) -> (B, P, n_bands)
+            stacked = torch.stack(outs, dim=0).permute(1, 2, 0)
+            mix = F.softmax(self.raw_band_mix, dim=-1)
+            if mix.ndim == 1:
+                # (n_bands,) -> (1, 1, n_bands)
+                mix = mix.view(1, 1, -1)
+            else:
+                # (P, n_bands) -> (1, P, n_bands)
+                mix = mix.unsqueeze(0)
+            y = (stacked * mix).sum(dim=-1)  # (B, P)
         return y, FIRState(history=history)
 
 

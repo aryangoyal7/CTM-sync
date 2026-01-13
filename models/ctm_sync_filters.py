@@ -232,14 +232,18 @@ class ContinuousThoughtMachineMultiBand(ContinuousThoughtMachine, _CTMSyncFilter
     """
     CTM variant with multi-band FIR synchronization filter bank.
 
-    Note: This increases the sync representation size to P * n_bands. This means:
-    - `q_proj` and `output_projector` shapes will differ from base checkpoints and must be re-initialized.
+    If `band_combine='concat'`, this increases the sync representation size to P * n_bands, meaning
+    `q_proj` and `output_projector` won't match base checkpoints.
+
+    If `band_combine='sum'`, the representation stays size P, so projections match base checkpoints,
+    allowing "filters-only" fine-tuning.
     """
 
     def __init__(
         self,
         *args,
         band_ks: List[int] = (8, 16, 32),
+        band_combine: str = "concat",
         fir_init: str = "exp",
         fir_exp_alpha: float = 0.5,
         **kwargs,
@@ -249,10 +253,14 @@ class ContinuousThoughtMachineMultiBand(ContinuousThoughtMachine, _CTMSyncFilter
         p_action = self.synch_representation_size_action
         p_out = self.synch_representation_size_out
         if p_action:
-            self.sync_filter_action = MultiBandFIRSyncFilter(p_action, list(band_ks), init=fir_init, exp_alpha=fir_exp_alpha)
+            self.sync_filter_action = MultiBandFIRSyncFilter(
+                p_action, list(band_ks), combine=band_combine, init=fir_init, exp_alpha=fir_exp_alpha
+            )
         else:
             self.sync_filter_action = None
-        self.sync_filter_out = MultiBandFIRSyncFilter(p_out, list(band_ks), init=fir_init, exp_alpha=fir_exp_alpha)
+        self.sync_filter_out = MultiBandFIRSyncFilter(
+            p_out, list(band_ks), combine=band_combine, init=fir_init, exp_alpha=fir_exp_alpha
+        )
 
     def forward(self, x, track: bool = False):
         B = x.size(0)

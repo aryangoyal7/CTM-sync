@@ -141,6 +141,7 @@ def parse_args():
 
     # Multiband specifics
     p.add_argument("--band_ks", type=int, nargs="+", default=[8, 16, 32])
+    p.add_argument("--band_combine", type=str, default="sum", choices=["sum", "concat"], help="sum keeps sync dim same as checkpoint; concat increases dim.")
     p.add_argument("--fir_init", type=str, default="exp", choices=["exp", "zeros", "randn"])
     p.add_argument("--fir_exp_alpha", type=float, default=0.5)
 
@@ -205,6 +206,7 @@ def main():
         neuron_select_type=_get("neuron_select_type", "random-pairing"),
         n_random_pairing_self=args.n_random_pairing_self,
         band_ks=args.band_ks,
+        band_combine=args.band_combine,
         fir_init=args.fir_init,
         fir_exp_alpha=args.fir_exp_alpha,
     ).to(device)
@@ -212,20 +214,11 @@ def main():
     dummy = torch.randn(1, 3, args.image_size, args.image_size, device=device)
     model(dummy)
 
-    # Multiband changes sync dimensionality -> q_proj/output_projector won't match the base checkpoint.
-    load_res = load_checkpoint_forgiving(
-        model,
-        args.checkpoint_path,
-        map_location=device,
-        strict=False,
-        drop_prefixes=("q_proj.", "output_projector."),
-    )
+    load_res = load_checkpoint_forgiving(model, args.checkpoint_path, map_location=device, strict=False)
     print(f"Loaded checkpoint. Missing={len(load_res.missing_keys)} Unexpected={len(load_res.unexpected_keys)}")
 
     set_requires_grad(model, False)
-    enabled = enable_requires_grad_by_prefix(
-        model, prefixes=("sync_filter_action", "sync_filter_out", "q_proj.", "output_projector.")
-    )
+    enabled = enable_requires_grad_by_prefix(model, prefixes=("sync_filter_action", "sync_filter_out"))
     print(f"Trainable params enabled: {len(enabled)}")
     opt = torch.optim.Adam(get_trainable_params(model), lr=args.lr)
 
