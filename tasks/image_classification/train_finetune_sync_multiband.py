@@ -8,7 +8,7 @@ from tasks.image_classification.train import get_dataset
 from utils.housekeeping import set_seed, zip_python_code
 from utils.losses import image_classification_loss
 
-from models.ctm_sync_filters import ContinuousThoughtMachineMultiBand
+from models.ctm_sync_filters import ContinuousThoughtMachineMultiBandReduced
 from tasks.image_classification.train_finetune_sync_common import (
     enable_requires_grad_by_prefix,
     get_trainable_params,
@@ -55,7 +55,6 @@ def parse_args():
 
     # Multiband specifics
     p.add_argument("--band_ks", type=int, nargs="+", default=[8, 16, 32])
-    p.add_argument("--band_combine", type=str, default="sum", choices=["sum", "concat"], help="sum keeps sync dim same as checkpoint; concat increases dim.")
     p.add_argument("--fir_init", type=str, default="exp", choices=["exp", "zeros", "randn"])
     p.add_argument("--fir_exp_alpha", type=float, default=0.5)
 
@@ -91,7 +90,7 @@ def main():
     prediction_reshaper = [-1]
     out_dims = len(class_labels)
 
-    model = ContinuousThoughtMachineMultiBand(
+    model = ContinuousThoughtMachineMultiBandReduced(
         iterations=args.iterations,
         d_model=args.d_model,
         d_input=args.d_input,
@@ -112,20 +111,19 @@ def main():
         neuron_select_type=args.neuron_select_type,
         n_random_pairing_self=args.n_random_pairing_self,
         band_ks=args.band_ks,
-        band_combine=args.band_combine,
         fir_init=args.fir_init,
         fir_exp_alpha=args.fir_exp_alpha,
     ).to(device)
 
-    # Initialize lazy modules
+    # Initialize lazy modules with the *new* sync dimensionality (P * n_bands)
     pseudo_inputs = train_data.__getitem__(0)[0].unsqueeze(0).to(device)
     model(pseudo_inputs)
 
-    # If band_combine='concat', projections won't match base checkpoints and will be dropped by shape filtering anyway.
+    # Reduced multiband keeps sync dimensionality -> q_proj/output_projector remain compatible.
     load_res = load_checkpoint_forgiving(model, args.checkpoint_path, map_location=device, strict=False)
     print(f"Loaded checkpoint. Missing={len(load_res.missing_keys)} Unexpected={len(load_res.unexpected_keys)}")
 
-    # Freeze everything; unfreeze ONLY multiband filter params.
+    # Freeze everything; unfreeze multiband filters + the two projection heads that must adapt to new dims.
     set_requires_grad(model, False)
     enabled = enable_requires_grad_by_prefix(model, prefixes=("sync_filter_action", "sync_filter_out"))
     print(f"Trainable params enabled: {len(enabled)}")

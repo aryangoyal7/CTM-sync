@@ -7,7 +7,14 @@ import torch
 import torch.nn as nn
 
 from models.ctm import ContinuousThoughtMachine
-from models.sync_filters import FIRState, IIRState, FIRSyncFilter, IIRSyncFilter, MultiBandFIRSyncFilter
+from models.sync_filters import (
+    FIRState,
+    IIRState,
+    FIRSyncFilter,
+    IIRSyncFilter,
+    MultiBandFIRSyncFilter,
+    MultiBandFIRSyncFilterReduced,
+)
 
 
 FilterState = Union[None, FIRState, IIRState]
@@ -232,18 +239,14 @@ class ContinuousThoughtMachineMultiBand(ContinuousThoughtMachine, _CTMSyncFilter
     """
     CTM variant with multi-band FIR synchronization filter bank.
 
-    If `band_combine='concat'`, this increases the sync representation size to P * n_bands, meaning
-    `q_proj` and `output_projector` won't match base checkpoints.
-
-    If `band_combine='sum'`, the representation stays size P, so projections match base checkpoints,
-    allowing "filters-only" fine-tuning.
+    Note: This increases the sync representation size to P * n_bands. This means:
+    - `q_proj` and `output_projector` shapes will differ from base checkpoints and must be re-initialized.
     """
 
     def __init__(
         self,
         *args,
         band_ks: List[int] = (8, 16, 32),
-        band_combine: str = "concat",
         fir_init: str = "exp",
         fir_exp_alpha: float = 0.5,
         **kwargs,
@@ -253,14 +256,10 @@ class ContinuousThoughtMachineMultiBand(ContinuousThoughtMachine, _CTMSyncFilter
         p_action = self.synch_representation_size_action
         p_out = self.synch_representation_size_out
         if p_action:
-            self.sync_filter_action = MultiBandFIRSyncFilter(
-                p_action, list(band_ks), combine=band_combine, init=fir_init, exp_alpha=fir_exp_alpha
-            )
+            self.sync_filter_action = MultiBandFIRSyncFilter(p_action, list(band_ks), init=fir_init, exp_alpha=fir_exp_alpha)
         else:
             self.sync_filter_action = None
-        self.sync_filter_out = MultiBandFIRSyncFilter(
-            p_out, list(band_ks), combine=band_combine, init=fir_init, exp_alpha=fir_exp_alpha
-        )
+        self.sync_filter_out = MultiBandFIRSyncFilter(p_out, list(band_ks), init=fir_init, exp_alpha=fir_exp_alpha)
 
     def forward(self, x, track: bool = False):
         B = x.size(0)
@@ -301,6 +300,99 @@ class ContinuousThoughtMachineMultiBand(ContinuousThoughtMachine, _CTMSyncFilter
 
             pp_out = self._pairwise_product(activated_state, "out")
             synchronisation_out, state_out = self.sync_filter_out(pp_out, state_out)  # (B, P*n_bands)
+
+            current_prediction = self.output_projector(synchronisation_out)
+            current_certainty = self.compute_certainty(current_prediction)
+
+            predictions[..., stepi] = current_prediction
+            certainties[..., stepi] = current_certainty
+
+            if track:
+                pre_activations_tracking.append(state_trace[:, :, -1].detach().cpu().numpy())
+                post_activations_tracking.append(activated_state.detach().cpu().numpy())
+                attention_tracking.append(attn_weights.detach().cpu().numpy())
+                synch_out_tracking.append(synchronisation_out.detach().cpu().numpy())
+                synch_action_tracking.append(synchronisation_action.detach().cpu().numpy())
+
+        if track:
+            return (
+                predictions,
+                certainties,
+                (np.array(synch_out_tracking), np.array(synch_action_tracking)),
+                np.array(pre_activations_tracking),
+                np.array(post_activations_tracking),
+                np.array(attention_tracking),
+            )
+        return predictions, certainties, synchronisation_out
+
+
+class ContinuousThoughtMachineMultiBandReduced(ContinuousThoughtMachine, _CTMSyncFilterMixin):
+    """
+    Multi-band FIR sync filter bank, but reduced back to the original sync dimensionality.
+
+    This keeps downstream shapes (q_proj/output_projector) compatible with pretrained checkpoints,
+    enabling "filter-only" fine-tuning without retraining projection heads.
+    """
+
+    def __init__(
+        self,
+        *args,
+        band_ks: List[int] = (8, 16, 32),
+        fir_init: str = "exp",
+        fir_exp_alpha: float = 0.5,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+
+        p_action = self.synch_representation_size_action
+        p_out = self.synch_representation_size_out
+        if p_action:
+            self.sync_filter_action = MultiBandFIRSyncFilterReduced(
+                p_action, list(band_ks), init=fir_init, exp_alpha=fir_exp_alpha
+            )
+        else:
+            self.sync_filter_action = None
+        self.sync_filter_out = MultiBandFIRSyncFilterReduced(p_out, list(band_ks), init=fir_init, exp_alpha=fir_exp_alpha)
+
+    def forward(self, x, track: bool = False):
+        B = x.size(0)
+        device = x.device
+
+        pre_activations_tracking = []
+        post_activations_tracking = []
+        synch_out_tracking = []
+        synch_action_tracking = []
+        attention_tracking = []
+
+        kv = self.compute_features(x)
+
+        state_trace = self.start_trace.unsqueeze(0).expand(B, -1, -1)
+        activated_state = self.start_activated_state.unsqueeze(0).expand(B, -1)
+
+        predictions = torch.empty(B, self.out_dims, self.iterations, device=device, dtype=torch.float32)
+        certainties = torch.empty(B, 2, self.iterations, device=device, dtype=torch.float32)
+
+        state_action: FilterState = None
+        state_out: FilterState = None
+
+        for stepi in range(self.iterations):
+            if self.sync_filter_action is not None:
+                pp_action = self._pairwise_product(activated_state, "action")
+                synchronisation_action, state_action = self.sync_filter_action(pp_action, state_action)  # (B, P)
+            else:
+                synchronisation_action = torch.zeros(B, 0, device=device, dtype=activated_state.dtype)
+
+            q = self.q_proj(synchronisation_action).unsqueeze(1)
+            attn_out, attn_weights = self.attention(q, kv, kv, average_attn_weights=False, need_weights=True)
+            attn_out = attn_out.squeeze(1)
+            pre_synapse_input = torch.concatenate((attn_out, activated_state), dim=-1)
+
+            state = self.synapses(pre_synapse_input)
+            state_trace = torch.cat((state_trace[:, :, 1:], state.unsqueeze(-1)), dim=-1)
+            activated_state = self.trace_processor(state_trace)
+
+            pp_out = self._pairwise_product(activated_state, "out")
+            synchronisation_out, state_out = self.sync_filter_out(pp_out, state_out)  # (B, P)
 
             current_prediction = self.output_projector(synchronisation_out)
             current_certainty = self.compute_certainty(current_prediction)

@@ -15,7 +15,7 @@ from tasks.image_classification.imagenet_classes import IMAGENET2012_CLASSES
 from utils.housekeeping import set_seed
 from utils.losses import image_classification_loss
 
-from models.ctm_sync_filters import ContinuousThoughtMachineMultiBand
+from models.ctm_sync_filters import ContinuousThoughtMachineMultiBandReduced
 from tasks.image_classification.train_finetune_sync_common import (
     enable_requires_grad_by_prefix,
     get_trainable_params,
@@ -141,7 +141,6 @@ def parse_args():
 
     # Multiband specifics
     p.add_argument("--band_ks", type=int, nargs="+", default=[8, 16, 32])
-    p.add_argument("--band_combine", type=str, default="sum", choices=["sum", "concat"], help="sum keeps sync dim same as checkpoint; concat increases dim.")
     p.add_argument("--fir_init", type=str, default="exp", choices=["exp", "zeros", "randn"])
     p.add_argument("--fir_exp_alpha", type=float, default=0.5)
 
@@ -185,7 +184,7 @@ def main():
     out_dims = len(IMAGENET2012_CLASSES)
     prediction_reshaper = [-1]
 
-    model = ContinuousThoughtMachineMultiBand(
+    model = ContinuousThoughtMachineMultiBandReduced(
         iterations=_get("iterations", 50),
         d_model=_get("d_model", 4096),
         d_input=_get("d_input", 1024),
@@ -206,7 +205,6 @@ def main():
         neuron_select_type=_get("neuron_select_type", "random-pairing"),
         n_random_pairing_self=args.n_random_pairing_self,
         band_ks=args.band_ks,
-        band_combine=args.band_combine,
         fir_init=args.fir_init,
         fir_exp_alpha=args.fir_exp_alpha,
     ).to(device)
@@ -214,6 +212,7 @@ def main():
     dummy = torch.randn(1, 3, args.image_size, args.image_size, device=device)
     model(dummy)
 
+    # Reduced multiband keeps sync dimensionality -> q_proj/output_projector remain compatible.
     load_res = load_checkpoint_forgiving(model, args.checkpoint_path, map_location=device, strict=False)
     print(f"Loaded checkpoint. Missing={len(load_res.missing_keys)} Unexpected={len(load_res.unexpected_keys)}")
 
