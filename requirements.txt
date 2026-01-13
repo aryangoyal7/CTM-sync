@@ -16,3 +16,4 @@ autoclip
 huggingface_hub
 safetensors
 tensorboard
+wandb
