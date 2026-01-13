@@ -39,7 +39,13 @@ def load_checkpoint_forgiving(
 ) -> torch.nn.modules.module._IncompatibleKeys:
     ckpt_path = resolve_checkpoint_path(checkpoint_path)
 
-    ckpt = torch.load(str(ckpt_path), map_location=map_location, weights_only=False)
+    # PyTorch 2.6+ defaults `weights_only=True`, which can fail on checkpoints that contain
+    # non-tensor objects (e.g. argparse.Namespace in ckpt["args"]). We trust our own checkpoints
+    # here and explicitly request `weights_only=False` when supported.
+    try:
+        ckpt = torch.load(str(ckpt_path), map_location=map_location, weights_only=False)
+    except TypeError:
+        ckpt = torch.load(str(ckpt_path), map_location=map_location)
     state_dict = extract_state_dict_from_checkpoint(ckpt, checkpoint_path=checkpoint_path)
 
     # Handle DDP 'module.' prefix if present.
@@ -119,8 +125,12 @@ def load_checkpoint_raw(checkpoint_path: str, *, map_location: str) -> Dict[str,
     Load a checkpoint dict (handling Drive zip bundles).
     """
     ckpt_path = resolve_checkpoint_path(checkpoint_path)
-    # `weights_only` is not supported on older torch; avoid passing it for compatibility.
-    ckpt = torch.load(str(ckpt_path), map_location=map_location)
+    # PyTorch 2.6+ defaults `weights_only=True`. Explicitly request `weights_only=False` when supported
+    # to allow loading common training checkpoints that include metadata like argparse.Namespace.
+    try:
+        ckpt = torch.load(str(ckpt_path), map_location=map_location, weights_only=False)
+    except TypeError:
+        ckpt = torch.load(str(ckpt_path), map_location=map_location)
     if not isinstance(ckpt, dict):
         raise ValueError(f"Expected checkpoint dict at {checkpoint_path}, got {type(ckpt)}")
     return ckpt
