@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -29,8 +28,25 @@ def maybe_set_hf_token(hf_token: Optional[str]) -> None:
         os.environ["HF_TOKEN"] = hf_token
 
 
+def _coerce_args_dict(maybe_args: Any) -> Dict[str, Any]:
+    if maybe_args is None:
+        return {}
+    if isinstance(maybe_args, dict):
+        return maybe_args
+    # argparse.Namespace
+    if hasattr(maybe_args, "__dict__"):
+        return dict(vars(maybe_args))
+    return {}
+
+
 def infer_arch_from_checkpoint(checkpoint_path: str) -> Tuple[Dict[str, Any], Dict[str, torch.Tensor]]:
+    """
+    Returns:
+      inferred_cfg: best-effort CTM config dict (prefers checkpoint['args'] if present)
+      sd: state dict (model weights)
+    """
     ckpt = load_checkpoint_raw(checkpoint_path, map_location="cpu")
+    ckpt_args = _coerce_args_dict(ckpt.get("args", None))
     sd = extract_state_dict_from_checkpoint(ckpt, checkpoint_path=checkpoint_path)
 
     d_model = int(sd["start_activated_state"].numel()) if "start_activated_state" in sd else None
@@ -84,12 +100,23 @@ def infer_arch_from_checkpoint(checkpoint_path: str) -> Tuple[Dict[str, Any], Di
         pass
 
     inferred = {
-        "d_model": d_model,
-        "d_input": d_input,
-        "synapse_depth": synapse_depth,
-        "neuron_select_type": neuron_select_type,
-        "n_synch_out": n_synch_out,
-        "n_synch_action": n_synch_action,
+        # Prefer explicit checkpoint args when available, else fall back to inference.
+        "d_model": ckpt_args.get("d_model", d_model),
+        "d_input": ckpt_args.get("d_input", d_input),
+        "synapse_depth": ckpt_args.get("synapse_depth", synapse_depth),
+        "neuron_select_type": ckpt_args.get("neuron_select_type", neuron_select_type),
+        "n_synch_out": ckpt_args.get("n_synch_out", n_synch_out),
+        "n_synch_action": ckpt_args.get("n_synch_action", n_synch_action),
+        "iterations": ckpt_args.get("iterations", None),
+        "heads": ckpt_args.get("heads", None),
+        "memory_length": ckpt_args.get("memory_length", None),
+        "memory_hidden_dims": ckpt_args.get("memory_hidden_dims", None),
+        "backbone_type": ckpt_args.get("backbone_type", None),
+        "positional_embedding_type": ckpt_args.get("positional_embedding_type", None),
+        "n_random_pairing_self": ckpt_args.get("n_random_pairing_self", None),
+        # ckpt uses `deep_memory`; CTM uses `deep_nlms`
+        "deep_nlms": ckpt_args.get("deep_memory", None),
+        "out_dims": ckpt_args.get("out_dims", None),
     }
     return inferred, sd
 

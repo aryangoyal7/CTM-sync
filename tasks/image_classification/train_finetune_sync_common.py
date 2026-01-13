@@ -35,6 +35,7 @@ def load_checkpoint_forgiving(
     map_location: str,
     strict: bool = False,
     drop_prefixes: Sequence[str] = (),
+    report_mismatches: int = 0,
 ) -> torch.nn.modules.module._IncompatibleKeys:
     ckpt_path = resolve_checkpoint_path(checkpoint_path)
 
@@ -54,17 +55,27 @@ def load_checkpoint_forgiving(
     target_sd = model.state_dict()
     filtered = {}
     dropped = 0
+    mismatches: List[Tuple[str, Tuple[int, ...], Tuple[int, ...]]] = []
     for k, v in state_dict.items():
         tv = target_sd.get(k, None)
         if tv is None:
             continue
         if hasattr(tv, "shape") and hasattr(v, "shape") and tuple(tv.shape) != tuple(v.shape):
             dropped += 1
+            if report_mismatches and len(mismatches) < report_mismatches:
+                try:
+                    mismatches.append((k, tuple(v.shape), tuple(tv.shape)))
+                except Exception:
+                    pass
             continue
         filtered[k] = v
 
     if dropped:
         print(f"[load_checkpoint_forgiving] Dropped {dropped} keys due to shape mismatch.")
+        if mismatches:
+            print("[load_checkpoint_forgiving] Example mismatches (checkpoint_shape -> model_shape):")
+            for k, cs, ms in mismatches:
+                print(f"  - {k}: {cs} -> {ms}")
 
     return model.load_state_dict(filtered, strict=strict)
 
@@ -108,7 +119,8 @@ def load_checkpoint_raw(checkpoint_path: str, *, map_location: str) -> Dict[str,
     Load a checkpoint dict (handling Drive zip bundles).
     """
     ckpt_path = resolve_checkpoint_path(checkpoint_path)
-    ckpt = torch.load(str(ckpt_path), map_location=map_location, weights_only=False)
+    # `weights_only` is not supported on older torch; avoid passing it for compatibility.
+    ckpt = torch.load(str(ckpt_path), map_location=map_location)
     if not isinstance(ckpt, dict):
         raise ValueError(f"Expected checkpoint dict at {checkpoint_path}, got {type(ckpt)}")
     return ckpt

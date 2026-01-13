@@ -28,6 +28,7 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--checkpoint_path", type=str, required=True)
     p.add_argument("--hf_token", type=str, default=None)
+    p.add_argument("--ckpt_report_mismatches", type=int, default=0)
 
     # data
     p.add_argument("--n_train", type=int, default=50000)
@@ -77,34 +78,40 @@ def main():
         shuffle_buffer_size=args.shuffle_buffer_size,
     )
 
-    out_dims = len(IMAGENET2012_CLASSES)
+    out_dims = int(inferred.get("out_dims") or len(IMAGENET2012_CLASSES))
     model = ContinuousThoughtMachineIIR(
-        iterations=50,
-        d_model=inferred.get("d_model", 4096),
-        d_input=inferred.get("d_input", 1024),
-        heads=4,
-        n_synch_out=inferred.get("n_synch_out", 512),
-        n_synch_action=inferred.get("n_synch_action", 512),
-        synapse_depth=inferred.get("synapse_depth", 8),
-        memory_length=25,
-        deep_nlms=True,
-        memory_hidden_dims=4,
+        iterations=int(inferred.get("iterations") or 50),
+        d_model=int(inferred.get("d_model") or 4096),
+        d_input=int(inferred.get("d_input") or 1024),
+        heads=int(inferred.get("heads") or 16),
+        n_synch_out=int(inferred.get("n_synch_out") or 512),
+        n_synch_action=int(inferred.get("n_synch_action") or 512),
+        synapse_depth=int(inferred.get("synapse_depth") or 8),
+        memory_length=int(inferred.get("memory_length") or 25),
+        deep_nlms=bool(True if inferred.get("deep_nlms") is None else inferred.get("deep_nlms")),
+        memory_hidden_dims=int(inferred.get("memory_hidden_dims") or 64),
         do_layernorm_nlm=False,
-        backbone_type="resnet18-4",
-        positional_embedding_type="none",
+        backbone_type=str(inferred.get("backbone_type") or "resnet152-4"),
+        positional_embedding_type=str(inferred.get("positional_embedding_type") or "none"),
         out_dims=out_dims,
         prediction_reshaper=[-1],
         dropout=0.0,
         dropout_nlm=None,
         neuron_select_type=inferred.get("neuron_select_type", "random-pairing") or "random-pairing",
-        n_random_pairing_self=0,
+        n_random_pairing_self=int(inferred.get("n_random_pairing_self") or 0),
         iir_alpha_init=args.iir_alpha_init,
         iir_eps=args.iir_eps,
     ).to(device)
 
     dummy = torch.randn(1, 3, args.image_size, args.image_size, device=device)
     model(dummy)
-    load_res = load_checkpoint_forgiving(model, args.checkpoint_path, map_location=device, strict=False)
+    load_res = load_checkpoint_forgiving(
+        model,
+        args.checkpoint_path,
+        map_location=device,
+        strict=False,
+        report_mismatches=args.ckpt_report_mismatches,
+    )
 
     set_requires_grad(model, False)
     enable_requires_grad_by_prefix(model, prefixes=("sync_filter_action", "sync_filter_out"))
