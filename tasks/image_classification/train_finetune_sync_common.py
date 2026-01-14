@@ -90,6 +90,11 @@ def resolve_checkpoint_path(checkpoint_path: str) -> Path:
     """
     If `checkpoint_path` is a zip bundle (e.g. the Drive download), extract the inner .pt and return its path.
     Otherwise return the original path.
+
+    IMPORTANT:
+    - PyTorch checkpoints saved with `torch.save(...)` may themselves be stored in a zip-based container format.
+      Those files are valid checkpoints and should be passed directly to `torch.load` (no extraction).
+    - We only extract when the zip contains a nested checkpoint file (*.pt/*.pth/*.bin), like the Google Drive bundle.
     """
     ckpt_path = Path(checkpoint_path)
     if zipfile.is_zipfile(ckpt_path):
@@ -101,8 +106,10 @@ def resolve_checkpoint_path(checkpoint_path: str) -> Path:
                 and (not m.startswith("__MACOSX/"))
                 and (m.lower().endswith(".pt") or m.lower().endswith(".pth") or m.lower().endswith(".bin"))
             ]
+            # If no nested checkpoint is present, this is likely a normal torch checkpoint in zip container format.
+            # In that case, do NOT extract; just let torch.load handle it.
             if len(members) == 0:
-                raise ValueError(f"No .pt/.pth/.bin files found inside zip checkpoint: {checkpoint_path}")
+                return ckpt_path
             inner = members[0] if len(members) == 1 else members[0]
             extracted = ckpt_path.parent / inner
             extracted.parent.mkdir(parents=True, exist_ok=True)
