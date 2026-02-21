@@ -1,0 +1,88 @@
+Robust Persistent Coherence (RPC) Synchronization: Explanation
+
+Overview
+--------
+RPC is a synchronization filter option for CTM that aims to be more robust to noise and short-term coincidences than a single exponential decay correlation.
+
+The original synchronization computes a per-pair exponentially weighted accumulation of pairwise products over internal ticks.
+That is effective and efficient, but with one main weakness: one timescale can mix persistent patterns and transient spikes.
+
+RPC addresses that by combining:
+1) robust clipping of pairwise products,
+2) fast and slow coherence traces,
+3) a persistence gate that compares slow vs fast behavior,
+4) scale normalization.
+
+Core Intuition
+--------------
+We want to keep weak but real patterns that repeat consistently over ticks, and suppress strong but brief coincidences.
+
+- If a pair's coupling is persistent, a slow trace stays high.
+- If a coupling is only transient/noisy, the fast trace spikes but the slow trace does not sustain.
+- A gate can use this difference to down-weight transient synchronization.
+
+Step-by-Step Formula
+--------------------
+For a selected neuron pair (i,j) at tick t:
+
+1) Mean-center each stream (slow running mean)
+   zc_i = z_i - m_i
+   zc_j = z_j - m_j
+
+2) Compute robust pair product
+   u = zc_i * zc_j
+   u_robust = delta * tanh(u / delta)
+   This limits outlier influence from large spikes.
+
+3) Update slow and fast coherence traces
+   c_s <- rho_s * c_s + (1 - rho_s) * u_robust
+   c_f <- rho_f * c_f + (1 - rho_f) * u_robust
+   with rho_f < rho_s (fast forgets quicker).
+
+4) Track per-stream power for normalization
+   var_i <- rho_s * var_i + (1 - rho_s) * zc_i^2
+   var_j <- rho_s * var_j + (1 - rho_s) * zc_j^2
+
+5) Persistence gate
+   g = sigmoid(k * (|c_s| - |c_f| - tau))
+
+6) Output synchronization for this pair
+   sync = g * c_s / sqrt(var_i * var_j + eps)
+
+Interpretation of Parameters
+----------------------------
+- delta (rpc_clip_delta): robustness scale. Lower = stronger clipping.
+- k (rpc_gate_scale): gate sharpness.
+- tau (rpc_tau): required persistence margin.
+- fast_offset (rpc_fast_offset): controls separation between slow and fast timescales.
+
+Expected Behavior
+-----------------
+Compared to original exp-decay synchronization:
+- Better suppression of short, high-amplitude transients.
+- Better retention of weak but persistent patterns.
+- More stable synchronization signal under noisy ticks.
+
+Cost and Tradeoff
+-----------------
+RPC keeps O(D_sub) per-tick scaling like original synchronization, but has a larger constant factor due to extra state updates (means, variances, fast/slow traces, gating).
+
+Code Touchpoints
+----------------
+Main implementation:
+- models/ctm.py
+
+Training support:
+- tasks/mazes/train.py
+- tasks/image_classification/train.py
+
+ImageNet subset support for low-compute tests:
+- data/custom_datasets.py
+- tasks/image_classification/download_imagenet_subset.py
+
+Backwards Compatibility
+-----------------------
+- Default mode remains: sync_mode = exp
+- New mode: sync_mode = rpc
+
+This allows loading existing checkpoints and doing targeted finetuning for controlled comparisons.

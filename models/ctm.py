@@ -1,5 +1,6 @@
 import torch.nn as nn
 import torch
+import torch.nn.functional as F
 import numpy as np
 import math
 from huggingface_hub import PyTorchModelHubMixin, hf_hub_download
@@ -98,6 +99,11 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
                  dropout_nlm=None,
                  neuron_select_type='random-pairing',  
                  n_random_pairing_self=0,
+                 sync_mode='exp',
+                 rpc_clip_delta=1.0,
+                 rpc_gate_scale=10.0,
+                 rpc_tau=0.0,
+                 rpc_fast_offset=2.0,
                  ):
         super(ContinuousThoughtMachine, self).__init__()
 
@@ -113,7 +119,12 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         self.out_dims = out_dims
         self.positional_embedding_type = positional_embedding_type
         self.neuron_select_type = neuron_select_type
+        self.sync_mode = sync_mode
         self.memory_length = memory_length
+        self.rpc_clip_delta_init = rpc_clip_delta
+        self.rpc_gate_scale_init = rpc_gate_scale
+        self.rpc_tau_init = rpc_tau
+        self.rpc_fast_offset_init = rpc_fast_offset
         dropout_nlm = dropout if dropout_nlm is None else dropout_nlm
 
         # --- Assertions ---
@@ -199,6 +210,95 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
 
     # --- Core CTM Methods ---
 
+    def _get_pairwise_activity(self, activated_state, synch_type):
+        if synch_type == 'action':  # Get action parameters
+            n_synch = self.n_synch_action
+            neuron_indices_left = self.action_neuron_indices_left
+            neuron_indices_right = self.action_neuron_indices_right
+        elif synch_type == 'out':  # Get output parameters
+            n_synch = self.n_synch_out
+            neuron_indices_left = self.out_neuron_indices_left
+            neuron_indices_right = self.out_neuron_indices_right
+        else:
+            raise ValueError(f"Invalid synch_type: {synch_type}")
+
+        if self.neuron_select_type in ('first-last', 'random'):
+            if self.neuron_select_type == 'first-last':
+                if synch_type == 'action':
+                    selected_left = selected_right = activated_state[:, -n_synch:]
+                else:
+                    selected_left = selected_right = activated_state[:, :n_synch]
+            else:
+                selected_left = activated_state[:, neuron_indices_left]
+                selected_right = activated_state[:, neuron_indices_right]
+
+            outer = selected_left.unsqueeze(2) * selected_right.unsqueeze(1)
+            i, j = torch.triu_indices(n_synch, n_synch, device=activated_state.device)
+            pairwise_product = outer[:, i, j]
+            pairwise_left = selected_left[:, i]
+            pairwise_right = selected_right[:, j]
+        elif self.neuron_select_type == 'random-pairing':
+            pairwise_left = activated_state[:, neuron_indices_left]
+            pairwise_right = activated_state[:, neuron_indices_right]
+            pairwise_product = pairwise_left * pairwise_right
+        else:
+            raise ValueError("Invalid neuron selection type")
+
+        return pairwise_product, pairwise_left, pairwise_right
+
+    def _get_decay_factors(self, decay_params, B, clamp_lims=(0, 15)):
+        return torch.exp(-torch.clamp(decay_params, clamp_lims[0], clamp_lims[1])).unsqueeze(0).expand(B, -1)
+
+    def _compute_rpc_synchronisation(self, pairwise_left, pairwise_right, rho_s, state, synch_type):
+        delta = F.softplus(getattr(self, f'rpc_clip_delta_{synch_type}')) + 1e-6
+        gate_scale = F.softplus(getattr(self, f'rpc_gate_scale_{synch_type}'))
+        tau = getattr(self, f'rpc_tau_{synch_type}')
+        fast_offset = F.softplus(getattr(self, f'rpc_fast_offset_{synch_type}'))
+
+        rho_s = torch.clamp(rho_s, min=1e-6, max=1 - 1e-6)
+        rho_f = torch.clamp(rho_s * torch.exp(-fast_offset), min=1e-6, max=1 - 1e-6)
+        one_minus_rho_s = 1 - rho_s
+        one_minus_rho_f = 1 - rho_f
+
+        if state is None:
+            m_left = pairwise_left
+            m_right = pairwise_right
+            c_s = pairwise_left * pairwise_right
+            c_f = c_s.clone()
+            var_left = torch.ones_like(pairwise_left)
+            var_right = torch.ones_like(pairwise_right)
+        else:
+            m_left = state['m_left']
+            m_right = state['m_right']
+            c_s = state['c_s']
+            c_f = state['c_f']
+            var_left = state['var_left']
+            var_right = state['var_right']
+
+        m_left = rho_s * m_left + one_minus_rho_s * pairwise_left
+        m_right = rho_s * m_right + one_minus_rho_s * pairwise_right
+
+        centered_left = pairwise_left - m_left
+        centered_right = pairwise_right - m_right
+
+        robust_prod = delta * torch.tanh((centered_left * centered_right) / delta)
+        c_s = rho_s * c_s + one_minus_rho_s * robust_prod
+        c_f = rho_f * c_f + one_minus_rho_f * robust_prod
+        var_left = rho_s * var_left + one_minus_rho_s * centered_left.square()
+        var_right = rho_s * var_right + one_minus_rho_s * centered_right.square()
+
+        gate = torch.sigmoid(gate_scale * (c_s.abs() - c_f.abs() - tau))
+        synchronisation = gate * c_s / torch.sqrt(var_left * var_right + 1e-6)
+        new_state = {
+            'm_left': m_left,
+            'm_right': m_right,
+            'c_s': c_s,
+            'c_f': c_f,
+            'var_left': var_left,
+            'var_right': var_right,
+        }
+        return synchronisation, new_state
+
     def compute_synchronisation(self, activated_state, decay_alpha, decay_beta, r, synch_type):
         """
         Computes synchronisation to be used as a vector representation. 
@@ -219,50 +319,25 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         See Appendix TODO of the Technical Report (TODO:LINK) for the maths that enables this method.
         """
 
-        if synch_type == 'action': # Get action parameters
-            n_synch = self.n_synch_action
-            neuron_indices_left = self.action_neuron_indices_left
-            neuron_indices_right = self.action_neuron_indices_right
-        elif synch_type == 'out': # Get input parameters
-            n_synch = self.n_synch_out
-            neuron_indices_left = self.out_neuron_indices_left
-            neuron_indices_right = self.out_neuron_indices_right
-        
-        if self.neuron_select_type in ('first-last', 'random'):
-            # For first-last and random, we compute the pairwise sync between all selected neurons
-            if self.neuron_select_type == 'first-last':
-                if synch_type == 'action': # Use last n_synch neurons for action
-                    selected_left = selected_right = activated_state[:, -n_synch:]
-                elif synch_type == 'out': # Use first n_synch neurons for out
-                    selected_left = selected_right = activated_state[:, :n_synch]
-            else: # Use the randomly selected neurons
-                selected_left = activated_state[:, neuron_indices_left]
-                selected_right = activated_state[:, neuron_indices_right]
-            
-            # Compute outer product of selected neurons
-            outer = selected_left.unsqueeze(2) * selected_right.unsqueeze(1)
-            # Resulting matrix is symmetric, so we only need the upper triangle
-            i, j = torch.triu_indices(n_synch, n_synch)
-            pairwise_product = outer[:, i, j]
-            
-        elif self.neuron_select_type == 'random-pairing':
-            # For random-pairing, we compute the sync between specific pairs of neurons
-            left = activated_state[:, neuron_indices_left]
-            right = activated_state[:, neuron_indices_right]
-            pairwise_product = left * right
-        else:
-            raise ValueError("Invalid neuron selection type")
-        
-        
-        
-        # Compute synchronisation recurrently
+        pairwise_product, pairwise_left, pairwise_right = self._get_pairwise_activity(activated_state, synch_type)
+
+        if self.sync_mode == 'rpc':
+            synchronisation, state = self._compute_rpc_synchronisation(
+                pairwise_left=pairwise_left,
+                pairwise_right=pairwise_right,
+                rho_s=r,
+                state=decay_alpha if isinstance(decay_alpha, dict) else None,
+                synch_type=synch_type,
+            )
+            return synchronisation, state, None
+
         if decay_alpha is None or decay_beta is None:
             decay_alpha = pairwise_product
             decay_beta = torch.ones_like(pairwise_product)
         else:
             decay_alpha = r * decay_alpha + pairwise_product
             decay_beta = r * decay_beta + 1
-        
+
         synchronisation = decay_alpha / (torch.sqrt(decay_beta))
         return synchronisation, decay_alpha, decay_beta
 
@@ -446,6 +521,23 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
             self.register_buffer(f'{synch_type}_neuron_indices_left', left)
             self.register_buffer(f'{synch_type}_neuron_indices_right', right)
             self.register_parameter(f'decay_params_{synch_type}', nn.Parameter(torch.zeros(synch_representation_size), requires_grad=True))
+            if self.sync_mode == 'rpc':
+                self.register_parameter(
+                    f'rpc_clip_delta_{synch_type}',
+                    nn.Parameter(torch.tensor(float(self.rpc_clip_delta_init), dtype=torch.float32), requires_grad=True),
+                )
+                self.register_parameter(
+                    f'rpc_gate_scale_{synch_type}',
+                    nn.Parameter(torch.tensor(float(self.rpc_gate_scale_init), dtype=torch.float32), requires_grad=True),
+                )
+                self.register_parameter(
+                    f'rpc_tau_{synch_type}',
+                    nn.Parameter(torch.tensor(float(self.rpc_tau_init), dtype=torch.float32), requires_grad=True),
+                )
+                self.register_parameter(
+                    f'rpc_fast_offset_{synch_type}',
+                    nn.Parameter(torch.tensor(float(self.rpc_fast_offset_init), dtype=torch.float32), requires_grad=True),
+                )
 
     def initialize_left_right_neurons(self, synch_type, d_model, n_synch, n_random_pairing_self=0):
         """
@@ -501,6 +593,7 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         
         assert self.positional_embedding_type in VALID_POSITIONAL_EMBEDDING_TYPES + ['none'], \
             f"Invalid positional_embedding_type: {self.positional_embedding_type}"
+        assert self.sync_mode in ('exp', 'rpc'), f"Invalid sync_mode: {self.sync_mode}"
         
         if self.neuron_select_type == 'first-last':
             assert self.d_model >= (self.n_synch_out + self.n_synch_action), \
@@ -548,9 +641,8 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
 
         # --- Initialise Recurrent Synch Values  ---
         decay_alpha_action, decay_beta_action = None, None
-        self.decay_params_action.data = torch.clamp(self.decay_params_action, 0, 15)  # Fix from github user: kuviki
-        self.decay_params_out.data = torch.clamp(self.decay_params_out, 0, 15)
-        r_action, r_out = torch.exp(-self.decay_params_action).unsqueeze(0).repeat(B, 1), torch.exp(-self.decay_params_out).unsqueeze(0).repeat(B, 1)
+        r_action = self._get_decay_factors(self.decay_params_action, B)
+        r_out = self._get_decay_factors(self.decay_params_out, B)
 
         _, decay_alpha_out, decay_beta_out = self.compute_synchronisation(activated_state, None, None, r_out, synch_type='out')
         # Compute learned weighting for synchronisation
@@ -601,4 +693,3 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         if track:
             return predictions, certainties, (np.array(synch_out_tracking), np.array(synch_action_tracking)), np.array(pre_activations_tracking), np.array(post_activations_tracking), np.array(attention_tracking)
         return predictions, certainties, synchronisation_out
-

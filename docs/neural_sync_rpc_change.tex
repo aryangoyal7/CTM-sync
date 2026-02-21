@@ -1,0 +1,232 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+
+\lstdefinestyle{pycode}{
+  language=Python,
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{blue!70!black},
+  commentstyle=\color{green!40!black},
+  stringstyle=\color{orange!60!black},
+  showstringspaces=false,
+  breaklines=true,
+  frame=single,
+  tabsize=4
+}
+
+\title{CTM Neural Synchronization Change: Exponential Decay $\rightarrow$ RPC Filter}
+\author{Implementation Note}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{Scope}
+This document records the exact proposed and implemented change to neural synchronization in CTM:
+\begin{itemize}
+  \item Original mechanism: single-timescale learnable exponential decay recursion.
+  \item New option: \textbf{RPC} (Robust Persistent Coherence) synchronization filter.
+\end{itemize}
+The change is implemented with backward compatibility:
+\texttt{sync\_mode='exp'} remains the default, and \texttt{sync\_mode='rpc'} enables the new filter.
+
+\section{Rationale}
+The original update tracks weighted pairwise products, but a single exponential kernel has limitations for robustness:
+\begin{itemize}
+  \item Strong short-term spikes can dominate accumulated synchronization.
+  \item Short coincidences are not explicitly separated from persistent structure.
+  \item Weak but consistent patterns can be overshadowed by high-amplitude noise.
+\end{itemize}
+
+RPC addresses this with four mechanisms:
+\begin{enumerate}
+  \item \textbf{Robust product clipping}: bounds one-step outlier impact.
+  \item \textbf{Dual timescales} (slow and fast): distinguishes persistent signal from transient coincidence.
+  \item \textbf{Persistence gate}: retains contributions only when slow coherence exceeds fast coincidence.
+  \item \textbf{Power normalization}: outputs scale-normalized coherence, reducing amplitude confounding.
+\end{enumerate}
+
+\section{Mathematical Form}
+For each selected neuron pair $(i,j)$ at tick $t$:
+\begin{align}
+\tilde{u}_t &= \delta\,\tanh\left(\frac{(z_{i,t}-\mu_{i,t})(z_{j,t}-\mu_{j,t})}{\delta}\right), \\
+ c_t^s &= \rho_s c_{t-1}^s + (1-\rho_s)\tilde{u}_t, \\
+ c_t^f &= \rho_f c_{t-1}^f + (1-\rho_f)\tilde{u}_t, \quad \rho_f < \rho_s, \\
+ g_t &= \sigma\big(k(|c_t^s|-|c_t^f|-\tau)\big), \\
+ \mathrm{sync}_t &= g_t\,\frac{c_t^s}{\sqrt{p_{i,t}p_{j,t}+\epsilon}}.
+\end{align}
+Implementation maps these to learnable parameters per synchronization stream (\texttt{out}, \texttt{action}):
+\texttt{rpc\_clip\_delta}, \texttt{rpc\_gate\_scale}, \texttt{rpc\_tau}, \texttt{rpc\_fast\_offset}.
+
+\section{Exact Code Snippets (Before $\rightarrow$ After)}
+
+\subsection{Core synchronization recursion}
+\textbf{Before} (single exponential recursion in \texttt{models/ctm.py}, pre-change):
+\begin{lstlisting}[style=pycode]
+# Compute synchronisation recurrently
+if decay_alpha is None or decay_beta is None:
+    decay_alpha = pairwise_product
+    decay_beta = torch.ones_like(pairwise_product)
+else:
+    decay_alpha = r * decay_alpha + pairwise_product
+    decay_beta = r * decay_beta + 1
+
+synchronisation = decay_alpha / (torch.sqrt(decay_beta))
+return synchronisation, decay_alpha, decay_beta
+\end{lstlisting}
+
+\textbf{After} (mode-switch in \texttt{/Users/aryangoyal/Sakana AI/continuous-thought-machines\_new/models/ctm.py}):
+\begin{lstlisting}[style=pycode]
+pairwise_product, pairwise_left, pairwise_right = self._get_pairwise_activity(activated_state, synch_type)
+
+if self.sync_mode == 'rpc':
+    synchronisation, state = self._compute_rpc_synchronisation(
+        pairwise_left=pairwise_left,
+        pairwise_right=pairwise_right,
+        rho_s=r,
+        state=decay_alpha if isinstance(decay_alpha, dict) else None,
+        synch_type=synch_type,
+    )
+    return synchronisation, state, None
+
+if decay_alpha is None or decay_beta is None:
+    decay_alpha = pairwise_product
+    decay_beta = torch.ones_like(pairwise_product)
+else:
+    decay_alpha = r * decay_alpha + pairwise_product
+    decay_beta = r * decay_beta + 1
+
+synchronisation = decay_alpha / (torch.sqrt(decay_beta))
+return synchronisation, decay_alpha, decay_beta
+\end{lstlisting}
+
+\subsection{RPC implementation block}
+\textbf{After} (new function in \texttt{/Users/aryangoyal/Sakana AI/continuous-thought-machines\_new/models/ctm.py}):
+\begin{lstlisting}[style=pycode]
+def _compute_rpc_synchronisation(self, pairwise_left, pairwise_right, rho_s, state, synch_type):
+    delta = F.softplus(getattr(self, f'rpc_clip_delta_{synch_type}')) + 1e-6
+    gate_scale = F.softplus(getattr(self, f'rpc_gate_scale_{synch_type}'))
+    tau = getattr(self, f'rpc_tau_{synch_type}')
+    fast_offset = F.softplus(getattr(self, f'rpc_fast_offset_{synch_type}'))
+
+    rho_s = torch.clamp(rho_s, min=1e-6, max=1 - 1e-6)
+    rho_f = torch.clamp(rho_s * torch.exp(-fast_offset), min=1e-6, max=1 - 1e-6)
+    one_minus_rho_s = 1 - rho_s
+    one_minus_rho_f = 1 - rho_f
+
+    if state is None:
+        m_left = pairwise_left
+        m_right = pairwise_right
+        c_s = pairwise_left * pairwise_right
+        c_f = c_s.clone()
+        var_left = torch.ones_like(pairwise_left)
+        var_right = torch.ones_like(pairwise_right)
+    else:
+        m_left = state['m_left']
+        m_right = state['m_right']
+        c_s = state['c_s']
+        c_f = state['c_f']
+        var_left = state['var_left']
+        var_right = state['var_right']
+
+    m_left = rho_s * m_left + one_minus_rho_s * pairwise_left
+    m_right = rho_s * m_right + one_minus_rho_s * pairwise_right
+
+    centered_left = pairwise_left - m_left
+    centered_right = pairwise_right - m_right
+
+    robust_prod = delta * torch.tanh((centered_left * centered_right) / delta)
+    c_s = rho_s * c_s + one_minus_rho_s * robust_prod
+    c_f = rho_f * c_f + one_minus_rho_f * robust_prod
+    var_left = rho_s * var_left + one_minus_rho_s * centered_left.square()
+    var_right = rho_s * var_right + one_minus_rho_s * centered_right.square()
+
+    gate = torch.sigmoid(gate_scale * (c_s.abs() - c_f.abs() - tau))
+    synchronisation = gate * c_s / torch.sqrt(var_left * var_right + 1e-6)
+    new_state = {
+        'm_left': m_left,
+        'm_right': m_right,
+        'c_s': c_s,
+        'c_f': c_f,
+        'var_left': var_left,
+        'var_right': var_right,
+    }
+    return synchronisation, new_state
+\end{lstlisting}
+
+\subsection{Parameter registration (new RPC learnables)}
+\textbf{Before}:
+\begin{lstlisting}[style=pycode]
+self.register_parameter(f'decay_params_{synch_type}', nn.Parameter(torch.zeros(synch_representation_size), requires_grad=True))
+\end{lstlisting}
+
+\textbf{After}:
+\begin{lstlisting}[style=pycode]
+self.register_parameter(f'decay_params_{synch_type}', nn.Parameter(torch.zeros(synch_representation_size), requires_grad=True))
+if self.sync_mode == 'rpc':
+    self.register_parameter(
+        f'rpc_clip_delta_{synch_type}',
+        nn.Parameter(torch.tensor(float(self.rpc_clip_delta_init), dtype=torch.float32), requires_grad=True),
+    )
+    self.register_parameter(
+        f'rpc_gate_scale_{synch_type}',
+        nn.Parameter(torch.tensor(float(self.rpc_gate_scale_init), dtype=torch.float32), requires_grad=True),
+    )
+    self.register_parameter(
+        f'rpc_tau_{synch_type}',
+        nn.Parameter(torch.tensor(float(self.rpc_tau_init), dtype=torch.float32), requires_grad=True),
+    )
+    self.register_parameter(
+        f'rpc_fast_offset_{synch_type}',
+        nn.Parameter(torch.tensor(float(self.rpc_fast_offset_init), dtype=torch.float32), requires_grad=True),
+    )
+\end{lstlisting}
+
+\subsection{Decay setup cleanup (removed in-forward \texttt{.data} clamp)}
+\textbf{Before}:
+\begin{lstlisting}[style=pycode]
+self.decay_params_action.data = torch.clamp(self.decay_params_action, 0, 15)
+self.decay_params_out.data = torch.clamp(self.decay_params_out, 0, 15)
+r_action, r_out = torch.exp(-self.decay_params_action).unsqueeze(0).repeat(B, 1), torch.exp(-self.decay_params_out).unsqueeze(0).repeat(B, 1)
+\end{lstlisting}
+
+\textbf{After}:
+\begin{lstlisting}[style=pycode]
+r_action = self._get_decay_factors(self.decay_params_action, B)
+r_out = self._get_decay_factors(self.decay_params_out, B)
+\end{lstlisting}
+
+\section{Training Surface Changes (for reproducible finetuning)}
+The training scripts were extended to support controlled experiments with this change:
+\begin{itemize}
+  \item \texttt{--sync\_mode exp|rpc} and RPC hyperparameters.
+  \item \texttt{--init\_checkpoint\_path}/\texttt{--init\_checkpoint\_dir} for external checkpoint initialization.
+  \item \texttt{--finetune\_sync\_only} to isolate synchronization-related learning.
+\end{itemize}
+Implemented in:
+\begin{itemize}
+  \item \texttt{/Users/aryangoyal/Sakana AI/continuous-thought-machines\_new/tasks/mazes/train.py}
+  \item \texttt{/Users/aryangoyal/Sakana AI/continuous-thought-machines\_new/tasks/image\_classification/train.py}
+\end{itemize}
+For ImageNet subset reproducibility, local subset support and downloader were added:
+\begin{itemize}
+  \item \texttt{/Users/aryangoyal/Sakana AI/continuous-thought-machines\_new/data/custom\_datasets.py}
+  \item \texttt{/Users/aryangoyal/Sakana AI/continuous-thought-machines\_new/tasks/image\_classification/download\_imagenet\_subset.py}
+\end{itemize}
+
+\section{Expected Behavior}
+Compared to the exponential baseline, RPC is expected to:
+\begin{itemize}
+  \item Reduce sensitivity to one-step activation bursts (noise suppression).
+  \item Suppress short-lived coincidences via fast/slow contrast gate.
+  \item Retain weak but persistent synchrony patterns over longer horizons.
+  \item Preserve backward compatibility by keeping \texttt{exp} as the default mode.
+\end{itemize}
+
+\end{document}

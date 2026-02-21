@@ -5,7 +5,7 @@ import random
 import numpy as np
 from tqdm.auto import tqdm
 from PIL import Image
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 
 class SortDataset(Dataset):
     def __init__(self, N):
@@ -115,7 +115,7 @@ class QAMNISTDataset(Dataset):
         return observations, question, question_readable, target
 
 class ImageNet(Dataset):
-    def __init__(self, which_split, transform):
+    def __init__(self, which_split, transform, hf_cache_dir=None, local_path=None):
         """
         Most simple form of the custom dataset structure. 
         Args:
@@ -125,7 +125,17 @@ class ImageNet(Dataset):
             operators (list): list of operators from which to sample
             action to take on observations (str): can be 'global' to compute operator over full observations, or 'select_K', where K=integer.
         """
-        dataset = load_dataset('imagenet-1k', split=which_split, trust_remote_code=True)
+        if local_path:
+            dataset = load_from_disk(local_path)
+        else:
+            load_kwargs = {
+                "path": "imagenet-1k",
+                "split": which_split,
+                "trust_remote_code": True,
+            }
+            if hf_cache_dir:
+                load_kwargs["cache_dir"] = hf_cache_dir
+            dataset = load_dataset(**load_kwargs)
 
         self.transform = transform
         self.base_dataset = dataset

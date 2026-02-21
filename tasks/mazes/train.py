@@ -1,6 +1,7 @@
 import argparse
 import os
 import random
+import re
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -81,6 +82,11 @@ def parse_args():
     parser.add_argument('--memory_hidden_dims', type=int, default=32, help='Hidden dimensions of the memory if using deep memory (CTM only).') # Default changed
     parser.add_argument('--dropout_nlm', type=float, default=None, help='Dropout rate for NLMs specifically. Unset to match dropout on the rest of the model (CTM only).')
     parser.add_argument('--do_normalisation', action=argparse.BooleanOptionalAction, default=False, help='Apply normalization in NLMs (CTM only).')
+    parser.add_argument('--sync_mode', type=str, default='exp', choices=['exp', 'rpc'], help='Synchronisation filter mode (CTM only).')
+    parser.add_argument('--rpc_clip_delta', type=float, default=1.0, help='RPC robust clipping scale (CTM only).')
+    parser.add_argument('--rpc_gate_scale', type=float, default=10.0, help='RPC persistence gate scale (CTM only).')
+    parser.add_argument('--rpc_tau', type=float, default=0.0, help='RPC persistence gate threshold (CTM only).')
+    parser.add_argument('--rpc_fast_offset', type=float, default=2.0, help='RPC fast-timescale offset (CTM only).')
     # LSTM specific
     parser.add_argument('--num_layers', type=int, default=2, help='Number of LSTM stacked layers (LSTM only).') # Added LSTM arg
 
@@ -117,6 +123,10 @@ def parse_args():
     parser.add_argument('--reload_model_only', action=argparse.BooleanOptionalAction, default=False, help='Reload only the model from disk?')
     parser.add_argument('--strict_reload', action=argparse.BooleanOptionalAction, default=True, help='Should use strict reload for model weights.') # Added back
     parser.add_argument('--ignore_metrics_when_reloading', action=argparse.BooleanOptionalAction, default=False, help='Ignore metrics when reloading (for debugging)?') # Added back
+    parser.add_argument('--init_checkpoint_path', type=str, default='', help='Optional external checkpoint file for finetuning init.')
+    parser.add_argument('--init_checkpoint_dir', type=str, default='', help='Optional directory containing checkpoint files for finetuning init.')
+    parser.add_argument('--init_strict_reload', action=argparse.BooleanOptionalAction, default=False, help='Strict loading for init checkpoint.')
+    parser.add_argument('--finetune_sync_only', action=argparse.BooleanOptionalAction, default=False, help='Freeze all parameters except synchronisation filter and sync heads (CTM only).')
 
     # Tracking
     parser.add_argument('--track_every', type=int, default=1000, help='Track metrics every this many iterations.')
@@ -129,6 +139,45 @@ def parse_args():
 
     args = parser.parse_args()
     return args
+
+
+def resolve_init_checkpoint_path(init_checkpoint_path, init_checkpoint_dir):
+    if init_checkpoint_path:
+        return init_checkpoint_path
+    if not init_checkpoint_dir:
+        return ''
+    checkpoint_pt = os.path.join(init_checkpoint_dir, 'checkpoint.pt')
+    if os.path.isfile(checkpoint_pt):
+        return checkpoint_pt
+    numbered = []
+    for name in os.listdir(init_checkpoint_dir):
+        match = re.fullmatch(r'checkpoint_(\d+)\.pt', name)
+        if match:
+            numbered.append((int(match.group(1)), os.path.join(init_checkpoint_dir, name)))
+    if numbered:
+        numbered.sort(key=lambda x: x[0])
+        return numbered[-1][1]
+    return ''
+
+
+def load_init_checkpoint(model, checkpoint_path, device, strict):
+    print(f'Loading init checkpoint from: {checkpoint_path}')
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    state_dict = checkpoint['model_state_dict'] if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint else checkpoint
+    load_result = model.load_state_dict(state_dict, strict=strict)
+    print(f" Init load complete. Missing: {load_result.missing_keys}, Unexpected: {load_result.unexpected_keys}")
+
+
+def configure_finetune_sync_only(model):
+    for param in model.parameters():
+        param.requires_grad = False
+    trainable_patterns = ('decay_params_', 'rpc_', 'q_proj', 'output_projector')
+    trainable_names = []
+    for name, param in model.named_parameters():
+        if any(pattern in name for pattern in trainable_patterns):
+            param.requires_grad = True
+            trainable_names.append(name)
+    print(f'Finetune sync-only enabled. Trainable params ({len(trainable_names)}): {trainable_names}')
 
 
 if __name__=='__main__':
@@ -184,6 +233,11 @@ if __name__=='__main__':
             dropout_nlm=args.dropout_nlm,
             neuron_select_type=args.neuron_select_type,
             n_random_pairing_self=args.n_random_pairing_self,
+            sync_mode=args.sync_mode,
+            rpc_clip_delta=args.rpc_clip_delta,
+            rpc_gate_scale=args.rpc_gate_scale,
+            rpc_tau=args.rpc_tau,
+            rpc_fast_offset=args.rpc_fast_offset,
         ).to(device)
     elif args.model == 'lstm':
          model = LSTMBaseline(
@@ -216,6 +270,15 @@ if __name__=='__main__':
     except Exception as e:
          print(f"Warning: Pseudo forward pass failed: {e}")
 
+    init_checkpoint_path = resolve_init_checkpoint_path(args.init_checkpoint_path, args.init_checkpoint_dir)
+    if init_checkpoint_path:
+        load_init_checkpoint(model, init_checkpoint_path, device, strict=args.init_strict_reload)
+
+    if args.finetune_sync_only:
+        if args.model != 'ctm':
+            raise ValueError('--finetune_sync_only is only supported for CTM.')
+        configure_finetune_sync_only(model)
+
     print(f'Total params: {sum(p.numel() for p in model.parameters())}')
 
     # Data
@@ -227,6 +290,7 @@ if __name__=='__main__':
 
     train_data = MazeImageFolder(root=f'{data_root}/train/', which_set='train', maze_route_length=args.maze_route_length, expand_range=args.expand_range)
     test_data = MazeImageFolder(root=f'{data_root}/test/', which_set='test', maze_route_length=args.maze_route_length, expand_range=args.expand_range)
+    print(f"Dataset sizes -> train: {len(train_data)}, test: {len(test_data)}")
 
     num_workers_test = 1 # Defaulting to 1, can be changed
     trainloader = torch.utils.data.DataLoader(train_data, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers_train, drop_last=True)
@@ -253,13 +317,17 @@ if __name__=='__main__':
         print(f'WARNING, excluding: {no_decay_names}')
 
     # Optimizer and scheduler (Common setup)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    if not trainable_params:
+        raise ValueError('No trainable parameters were found. Check finetuning/freezing settings.')
+
     if len(no_decay_names) and args.weight_decay!=0:
         optimizer = torch.optim.AdamW([{'params': decay_params, 'weight_decay':args.weight_decay},
                                        {'params': no_decay_params, 'weight_decay':0}],
                                   lr=args.lr,
                                   eps=1e-8 if not args.use_amp else 1e-6)
     else:
-        optimizer = torch.optim.AdamW(model.parameters(),
+        optimizer = torch.optim.AdamW(trainable_params,
                                     lr=args.lr,
                                     eps=1e-8 if not args.use_amp else 1e-6,
                                     weight_decay=args.weight_decay)
@@ -425,7 +493,7 @@ if __name__=='__main__':
 
             if args.gradient_clipping!=-1: 
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.gradient_clipping)
+                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=args.gradient_clipping)
 
             scaler.step(optimizer)
             scaler.update()
